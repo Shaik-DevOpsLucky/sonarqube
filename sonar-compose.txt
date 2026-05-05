@@ -1,0 +1,248 @@
+
+
+1. create an ec2 instance
+2. Install docker and docker-compose
+sudo apt update
+sudo apt install -y docker.io docker-compose
+sudo systemctl enable docker
+sudo systemctl start docker
+sudo usermod -aG docker $USER
+newgrp docker
+docker network create sonarnet
+
+sudo sysctl -w vm.max_map_count=262144
+sudo sysctl -w fs.file-max=65536
+
+echo "vm.max_map_count=262144" | sudo tee -a /etc/sysctl.conf
+echo "fs.file-max=65536" | sudo tee -a /etc/sysctl.conf
+
+mkdir sonarqube-setup && cd sonarqube-setup
+
+##### vi docker-compose.yml
+
+version: "3.8"
+
+services:
+  postgres:
+    image: postgres:15
+    container_name: sonar-postgres
+    restart: always
+    environment:
+      POSTGRES_USER: sonar
+      POSTGRES_PASSWORD: <strong_password>
+      POSTGRES_DB: sonarqube
+    volumes:
+      - sonar_postgres_data:/var/lib/postgresql/data
+    networks:
+      - sonarnet
+
+  sonarqube:
+    image: sonarqube:9.9-community
+    container_name: sonar-server
+    depends_on:
+      - postgres
+    ports:
+      - "9000:9000"
+    restart: always
+    environment:
+      SONAR_JDBC_URL: jdbc:postgresql://postgres:5432/sonarqube
+      SONAR_JDBC_USERNAME: sonar
+      SONAR_JDBC_PASSWORD: <strong_password>
+      SONAR_WEB_JAVAOPTS: "-Xmx512m"
+      SONAR_CE_JAVAOPTS: "-Xmx512m"
+    volumes:
+      - sonar_data:/opt/sonarqube/data
+      - sonar_extensions:/opt/sonarqube/extensions
+      - sonar_logs:/opt/sonarqube/logs
+    networks:
+      - sonarnet
+
+volumes:
+  sonar_postgres_data:
+  sonar_data:
+  sonar_extensions:
+  sonar_logs:
+
+networks:
+  sonarnet:
+
+docker-compose up -d
+
+#### After Setup
+
+Access:
+
+http://<EC2-PUBLIC-IP>:9000
+
+Login:
+
+admin / admin
+
+
+Then:
+
+Create project
+Generate token
+Integrate with pipeline
+
+# 1.2 Create Project in SonarQube
+Go to Projects → Create Project
+Choose Manually
+Enter:
+Project Key: backend
+Display Name: Backend
+
+# 1.3 Generate Token
+
+Go to:
+
+My Account → Security → Generate Token
+
+Example:
+
+Name: bitbucket-token
+
+Copy token (important).
+
+
+# STEP 2: Configure Bitbucket Variables
+
+In Bitbucket:
+
+Go to Repository Settings → Pipelines → Repository Variables
+
+Add:
+
+SONAR_HOST_URL = http://<your-sonarqube-ip>:9000
+SONAR_TOKEN    = <your_token>
+
+⚠️ Important:
+
+If SonarQube is local → Bitbucket cloud cannot access it
+You must:
+Use public IP
+
+# STEP 3: Add Sonar Configuration File
+
+Create file in root:
+
+sonar-project.properties
+sonar.projectKey= backend
+sonar.projectName= Backend
+sonar.projectVersion=1.0
+
+#Source code location
+sonar.sources=src
+
+#Language
+sonar.language=js
+
+#Encoding
+sonar.sourceEncoding=UTF-8
+
+#Exclusions
+sonar.exclusions=node_modules/**,dist/**
+
+#Coverage (optional)
+sonar.javascript.lcov.reportPaths=coverage/lcov.info
+#Exclusions
+sonar.exclusions=node_modules/**,layer/**,.aws-sam/**
+
+#Coverage (if you add tests)
+sonar.javascript.lcov.reportPaths=coverage/lcov.info
+
+#############################
+bitbucket-pipeline.yaml
+########################
+image: node:18
+
+pipelines:
+  branches:
+    main:
+      - step:
+          name: "Build, Scan & Deploy - Backend (Dev)"
+          caches:
+            - node
+
+          script:
+            # 🧩 System dependencies
+            - echo "🔧 Installing system dependencies..."
+            - apt-get update && apt-get install -y unzip curl python3 python3-pip python3-venv
+
+            # 🐍 AWS CLI & SAM CLI
+            - echo "⚙️ Setting up AWS CLI & SAM CLI..."
+            - python3 -m venv venv
+            - . venv/bin/activate
+            - pip install --upgrade pip
+            - pip install --no-cache-dir awscli aws-sam-cli
+
+            # 📦 Install dependencies (src)
+            - echo "📦 Installing Lambda (src) dependencies..."
+            - cd src
+            - npm install --omit=dev
+            - cd ..
+
+            # ✅ (OPTIONAL but recommended) Run tests before scan
+            # - npm run test -- --coverage
+
+            # ============================
+            # 🔍 SONARQUBE INTEGRATION
+            # ============================
+            - echo "🔍 Installing SonarScanner..."
+            - curl -sSLo sonar-scanner.zip https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-5.0.1.3006-linux.zip
+            - unzip sonar-scanner.zip
+            - export PATH=$PATH:$(pwd)/sonar-scanner-*/bin
+
+            - echo "🚀 Running SonarQube analysis..."
+            - sonar-scanner \
+                -Dsonar.host.url=$SONAR_HOST_URL \
+                -Dsonar.login=$SONAR_TOKEN \
+                -Dsonar.qualitygate.wait=true
+
+            # ============================
+            # 📦 LAYER SETUP (your existing)
+            # ============================
+            - echo "📦 Installing Lambda Layer dependencies..."
+            - cd layer/nodejs
+            - rm -rf node_modules package-lock.json
+            - npm install --omit=dev
+            - find node_modules -name "*.md" -delete
+            - find node_modules -name "*.map" -delete
+            - find node_modules -name "test" -type d -exec rm -rf {} +
+            - find node_modules -name "__tests__" -type d -exec rm -rf {} +
+            - du -sh node_modules
+            - cd ../../
+
+            # 🧹 Clean build
+            - echo "🧹 Cleaning previous SAM build artifacts..."
+            - rm -rf .aws-sam
+
+            # 🧱 Build
+            - echo "🏗️ Building SAM application..."
+            - sam validate
+            - sam build --no-cached
+
+            # 🚀 Deploy
+            - echo "🚀 Deploying Backend (Dev)..."
+            - >
+              sam deploy
+              --no-confirm-changeset
+              --no-fail-on-empty-changeset
+              --resolve-s3
+              --stack-name backend-dev
+              --region ap-southeast-2
+              --capabilities CAPABILITY_IAM
+              --parameter-overrides
+              DBSecretArn="arn:aws:secretsmanager:ap-southeast-2:<AccountID>:secret:prod/db/credentials-kdhi"
+
+            - echo "✅ Deployment completed successfully"
+
+          artifacts:
+            - .aws-sam/build/**
+
+
+
+
+
+
+
