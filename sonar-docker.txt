@@ -1,0 +1,54 @@
+Sonarqube intigration with bitbucket
+====================================
+
+1. Create and EC2 machine in public subnet
+Install docker,
+
+docker network create sonarnet
+
+Step 2: Run PostgreSQL container
+docker run -d \
+  --name sonar-postgres \
+  --network sonarnet \
+  -e POSTGRES_USER=sonar \
+  -e POSTGRES_PASSWORD=sonar123 \
+  -e POSTGRES_DB=sonarqube \
+  -v sonar_postgres_data:/var/lib/postgresql/data \
+  postgres:15
+
+👉 You can change username/password as needed.
+
+
+Step 3: Run SonarQube with PostgreSQL
+
+Stop your existing container first (if already running):
+
+docker stop sonar-server && docker rm sonar-server
+
+
+Now run:
+
+docker run -d \
+  --name sonar-server \
+  --network sonarnet \
+  -p 9000:9000 \
+  -e SONAR_JDBC_URL=jdbc:postgresql://sonar-postgres:5432/sonarqube \
+  -e SONAR_JDBC_USERNAME=sonar \
+  -e SONAR_JDBC_PASSWORD=sonar123 \
+  -v sonar_data:/opt/sonarqube/data \
+  -v sonar_extensions:/opt/sonarqube/extensions \
+  -v sonar_logs:/opt/sonarqube/logs \
+  sonarqube:community
+
+Step 4: Access SonarQube
+
+Open:
+
+http://publicip:9000
+
+Default login:
+
+username: admin
+password: admin
+
+
